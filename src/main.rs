@@ -59,6 +59,7 @@ struct Objetivo {
 
 // --- Middleware de Segurança ---
 async fn validador_seguranca(req: Request<axum::body::Body>, next: Next) -> Result<Response, StatusCode> {
+    // O CORS agora lida com as requisições OPTIONS automaticamente antes de chegar aqui
     let auth_header = req.headers().get("x-api-key").and_then(|h| h.to_str().ok());
     let chave_mestra = "JORGE_E_LETICIA_2026"; 
 
@@ -74,7 +75,6 @@ async fn validador_seguranca(req: Request<axum::body::Body>, next: Next) -> Resu
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     
-    // Conexão com o Banco de Dados via Variável de Ambiente no Render
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL não configurada");
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -83,30 +83,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✅ Backend Seguro e Online - Jorge & Leticia");
 
-    // Configuração de CORS para permitir acesso do GitHub Pages
+    // Configuração de CORS: ESSENCIAL para GitHub Pages e Preflight (OPTIONS)
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any);
 
     let app = Router::new()
-        // Rotas de Transações
         .route("/lancar", post(handler_lancar))
         .route("/listar", get(handler_listar))
         .route("/transacao/:id", delete(handler_deletar_transacao))
         .route("/resumo", get(handler_resumo))
-        // Rotas de Categorias
         .route("/categorias", get(handler_categorias))
         .route("/categorias", post(handler_criar_categoria))
-        // Rotas de Objetivos
         .route("/objetivos", get(handler_listar_objetivos))
         .route("/objetivos", post(handler_criar_objetivo))
         .route("/objetivos/:id", delete(handler_deletar_objetivo))
         .route("/objetivos/:id", post(handler_editar_objetivo))
         .route("/objetivos/:id/aportar", post(handler_aportar))
-        // Middlewares
-        .layer(cors)
-        .layer(middleware::from_fn(validador_seguranca))
+        // ATENÇÃO À ORDEM DOS LAYERS:
+        // O layer adicionado por último é o PRIMEIRO a processar a requisição.
+        .layer(middleware::from_fn(validador_seguranca)) 
+        .layer(cors) // O CORS DEVE VIR POR FORA DA SEGURANÇA
         .with_state(pool);
 
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
@@ -115,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- Handlers de Transações ---
+// --- Handlers ---
 
 async fn handler_resumo(State(pool): State<Pool<Postgres>>, Query(params): Query<HashMap<String, String>>) -> Result<Json<ResumoFinanceiro>, String> {
     let mes_p = params.get("mes").cloned().unwrap_or_else(|| "4".to_string());
@@ -165,8 +163,6 @@ async fn handler_deletar_transacao(State(pool): State<Pool<Postgres>>, Path(id):
     Ok(Json("Ok".to_string()))
 }
 
-// --- Handlers de Objetivos ---
-
 async fn handler_listar_objetivos(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<Objetivo>>, String> {
     let rows = sqlx::query("SELECT id, nome, valor_total, valor_guardado, data_limite::text FROM objetivos ORDER BY id DESC")
         .fetch_all(&pool).await.map_err(|e| e.to_string())?;
@@ -210,8 +206,6 @@ async fn handler_aportar(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>
         .bind(format!("Aporte: {}", nome)).bind(valor).execute(&pool).await.map_err(|e| e.to_string())?;
     Ok(Json("Ok".to_string()))
 }
-
-// --- Handlers de Categorias ---
 
 async fn handler_categorias(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<Categoria>>, String> {
     let rows = sqlx::query_as::<_, Categoria>("SELECT id, nome FROM categorias ORDER BY nome").fetch_all(&pool).await.map_err(|e| e.to_string())?;
