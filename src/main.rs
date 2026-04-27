@@ -61,7 +61,7 @@ struct Objetivo {
 async fn validador_seguranca(req: Request<axum::body::Body>, next: Next) -> Result<Response, StatusCode> {
     // O CORS agora lida com as requisições OPTIONS automaticamente antes de chegar aqui
     let auth_header = req.headers().get("x-api-key").and_then(|h| h.to_str().ok());
-    let chave_mestra = "JORGE_E_LETICIA_2026"; 
+    let chave_mestra = "jorgeeleticia@2026"; 
 
     if let Some(chave) = auth_header {
         if chave == chave_mestra {
