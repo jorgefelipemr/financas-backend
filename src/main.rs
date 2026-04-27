@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, Method},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
@@ -12,9 +12,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::env;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 
-// --- Estruturas ---
+// --- Estruturas de Dados ---
 #[derive(Deserialize)]
 struct NovoGasto {
     descricao: String,
@@ -73,32 +73,50 @@ async fn validador_seguranca(req: Request<axum::body::Body>, next: Next) -> Resu
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
-    let pool = PgPoolOptions::new().max_connections(5).connect(&env::var("DATABASE_URL")?).await?;
+    
+    // Conexão com o Banco de Dados via Variável de Ambiente no Render
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL não configurada");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
 
-    println!("✅ Backend Seguro Rodando - Jorge & Leticia");
+    println!("✅ Backend Seguro e Online - Jorge & Leticia");
+
+    // Configuração de CORS para permitir acesso do GitHub Pages
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers(Any);
 
     let app = Router::new()
+        // Rotas de Transações
         .route("/lancar", post(handler_lancar))
         .route("/listar", get(handler_listar))
         .route("/transacao/:id", delete(handler_deletar_transacao))
+        .route("/resumo", get(handler_resumo))
+        // Rotas de Categorias
         .route("/categorias", get(handler_categorias))
         .route("/categorias", post(handler_criar_categoria))
-        .route("/resumo", get(handler_resumo))
+        // Rotas de Objetivos
         .route("/objetivos", get(handler_listar_objetivos))
         .route("/objetivos", post(handler_criar_objetivo))
         .route("/objetivos/:id", delete(handler_deletar_objetivo))
         .route("/objetivos/:id", post(handler_editar_objetivo))
         .route("/objetivos/:id/aportar", post(handler_aportar))
-        .layer(middleware::from_fn(validador_seguranca)) // Protege todas as rotas acima
-        .layer(CorsLayer::permissive())
+        // Middlewares
+        .layer(cors)
+        .layer(middleware::from_fn(validador_seguranca))
         .with_state(pool);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-// --- Handlers ---
+// --- Handlers de Transações ---
+
 async fn handler_resumo(State(pool): State<Pool<Postgres>>, Query(params): Query<HashMap<String, String>>) -> Result<Json<ResumoFinanceiro>, String> {
     let mes_p = params.get("mes").cloned().unwrap_or_else(|| "4".to_string());
     let condicao = if mes_p == "todos" { "TRUE".to_string() } else { format!("EXTRACT(MONTH FROM data_criacao) = {}", mes_p) };
@@ -117,7 +135,12 @@ async fn handler_resumo(State(pool): State<Pool<Postgres>>, Query(params): Query
         Estatisticas { categoria: r.get("categoria"), total: t.to_string().parse().unwrap_or(0.0) }
     }).collect();
 
-    Ok(Json(ResumoFinanceiro { receitas: rec.to_string().parse().unwrap_or(0.0), despesas: des.to_string().parse().unwrap_or(0.0), saldo: (rec - des).to_string().parse().unwrap_or(0.0), stats }))
+    Ok(Json(ResumoFinanceiro { 
+        receitas: rec.to_string().parse().unwrap_or(0.0), 
+        despesas: des.to_string().parse().unwrap_or(0.0), 
+        saldo: (rec - des).to_string().parse().unwrap_or(0.0), 
+        stats 
+    }))
 }
 
 async fn handler_lancar(State(pool): State<Pool<Postgres>>, Json(p): Json<NovoGasto>) -> Result<Json<String>, String> {
@@ -129,7 +152,7 @@ async fn handler_lancar(State(pool): State<Pool<Postgres>>, Json(p): Json<NovoGa
 }
 
 async fn handler_listar(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<Gasto>>, String> {
-    let rows = sqlx::query("SELECT id, descricao, valor, responsavel, TO_CHAR(data_criacao, 'DD/MM') as data_fmt FROM transacoes ORDER BY data_criacao DESC, id DESC LIMIT 15")
+    let rows = sqlx::query("SELECT id, descricao, valor, responsavel, TO_CHAR(data_criacao, 'DD/MM') as data_fmt FROM transacoes ORDER BY data_criacao DESC, id DESC LIMIT 20")
         .fetch_all(&pool).await.map_err(|e| e.to_string())?;
     Ok(Json(rows.iter().map(|r| {
         let v: sqlx::types::BigDecimal = r.get("valor");
@@ -137,28 +160,12 @@ async fn handler_listar(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<G
     }).collect()))
 }
 
-async fn handler_aportar(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>, Json(p): Json<serde_json::Value>) -> Result<Json<String>, String> {
-    let valor = p["valor"].as_f64().unwrap_or(0.0);
-    sqlx::query("UPDATE objetivos SET valor_guardado = valor_guardado + $1 WHERE id = $2").bind(valor).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
-    let row_nome = sqlx::query("SELECT nome FROM objetivos WHERE id = $1").bind(id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
-    let nome: String = row_nome.get("nome");
-    sqlx::query("INSERT INTO transacoes (descricao, valor, tipo, categoria_id, responsavel, data_criacao) VALUES ($1, $2, 'Despesa', (SELECT id FROM categorias LIMIT 1), 'Sistema', NOW())")
-        .bind(format!("Aporte: {}", nome)).bind(valor).execute(&pool).await.map_err(|e| e.to_string())?;
+async fn handler_deletar_transacao(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>) -> Result<Json<String>, String> {
+    sqlx::query("DELETE FROM transacoes WHERE id = $1").bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
     Ok(Json("Ok".to_string()))
 }
 
-async fn handler_deletar_objetivo(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>) -> Result<Json<String>, String> {
-    sqlx::query("DELETE FROM objetivos WHERE id = $1").bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Json("Removido".to_string()))
-}
-
-async fn handler_editar_objetivo(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>, Json(p): Json<serde_json::Value>) -> Result<Json<String>, String> {
-    let nome = p["nome"].as_str().ok_or("Nome inválido")?;
-    let valor_total = p["valor_total"].as_f64().ok_or("Valor inválido")?;
-    let data_limite = p["data_limite"].as_str().ok_or("Data inválida")?;
-    sqlx::query("UPDATE objetivos SET nome = $1, valor_total = $2, data_limite = $3::date WHERE id = $4").bind(nome).bind(valor_total).bind(data_limite).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Json("Atualizado".to_string()))
-}
+// --- Handlers de Objetivos ---
 
 async fn handler_listar_objetivos(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<Objetivo>>, String> {
     let rows = sqlx::query("SELECT id, nome, valor_total, valor_guardado, data_limite::text FROM objetivos ORDER BY id DESC")
@@ -171,9 +178,40 @@ async fn handler_listar_objetivos(State(pool): State<Pool<Postgres>>) -> Result<
 }
 
 async fn handler_criar_objetivo(State(pool): State<Pool<Postgres>>, Json(p): Json<Objetivo>) -> Result<Json<String>, String> {
-    sqlx::query("INSERT INTO objetivos (nome, valor_total, valor_guardado, data_limite) VALUES ($1, $2, $3, $4::date)").bind(&p.nome).bind(p.valor_total).bind(p.valor_guardado).bind(&p.data_limite).execute(&pool).await.map_err(|e| e.to_string())?;
+    sqlx::query("INSERT INTO objetivos (nome, valor_total, valor_guardado, data_limite) VALUES ($1, $2, $3, $4::date)")
+        .bind(&p.nome).bind(p.valor_total).bind(p.valor_guardado).bind(&p.data_limite)
+        .execute(&pool).await.map_err(|e| e.to_string())?;
     Ok(Json("Ok".to_string()))
 }
+
+async fn handler_deletar_objetivo(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>) -> Result<Json<String>, String> {
+    sqlx::query("DELETE FROM objetivos WHERE id = $1").bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+    Ok(Json("Removido".to_string()))
+}
+
+async fn handler_editar_objetivo(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>, Json(p): Json<serde_json::Value>) -> Result<Json<String>, String> {
+    let nome = p["nome"].as_str().ok_or("Nome inválido")?;
+    let valor_total = p["valor_total"].as_f64().ok_or("Valor inválido")?;
+    let data_limite = p["data_limite"].as_str().ok_or("Data inválida")?;
+    sqlx::query("UPDATE objetivos SET nome = $1, valor_total = $2, data_limite = $3::date WHERE id = $4")
+        .bind(nome).bind(valor_total).bind(data_limite).bind(id)
+        .execute(&pool).await.map_err(|e| e.to_string())?;
+    Ok(Json("Atualizado".to_string()))
+}
+
+async fn handler_aportar(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>, Json(p): Json<serde_json::Value>) -> Result<Json<String>, String> {
+    let valor = p["valor"].as_f64().unwrap_or(0.0);
+    sqlx::query("UPDATE objetivos SET valor_guardado = valor_guardado + $1 WHERE id = $2").bind(valor).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+    
+    let row_nome = sqlx::query("SELECT nome FROM objetivos WHERE id = $1").bind(id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+    let nome: String = row_nome.get("nome");
+
+    sqlx::query("INSERT INTO transacoes (descricao, valor, tipo, categoria_id, responsavel, data_criacao) VALUES ($1, $2, 'Despesa', (SELECT id FROM categorias LIMIT 1), 'Sistema', NOW())")
+        .bind(format!("Aporte: {}", nome)).bind(valor).execute(&pool).await.map_err(|e| e.to_string())?;
+    Ok(Json("Ok".to_string()))
+}
+
+// --- Handlers de Categorias ---
 
 async fn handler_categorias(State(pool): State<Pool<Postgres>>) -> Result<Json<Vec<Categoria>>, String> {
     let rows = sqlx::query_as::<_, Categoria>("SELECT id, nome FROM categorias ORDER BY nome").fetch_all(&pool).await.map_err(|e| e.to_string())?;
@@ -183,10 +221,5 @@ async fn handler_categorias(State(pool): State<Pool<Postgres>>) -> Result<Json<V
 async fn handler_criar_categoria(State(pool): State<Pool<Postgres>>, Json(p): Json<serde_json::Value>) -> Result<Json<String>, String> {
     let n = p["nome"].as_str().ok_or("Invalido")?;
     sqlx::query("INSERT INTO categorias (nome) VALUES ($1)").bind(n).execute(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Json("Ok".to_string()))
-}
-
-async fn handler_deletar_transacao(State(pool): State<Pool<Postgres>>, Path(id): Path<i32>) -> Result<Json<String>, String> {
-    sqlx::query("DELETE FROM transacoes WHERE id = $1").bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
     Ok(Json("Ok".to_string()))
 }
